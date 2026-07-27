@@ -10,7 +10,7 @@ import time
 from model import ChessBrain
 
 # --- Hyperparameters ---
-EPISODES = 100 
+EPISODES = 500
 BATCH_SIZE = 128 
 GAMMA = 0.95
 LR = 0.001
@@ -20,11 +20,20 @@ EPSILON_END = 0.1
 EPSILON_DECAY = 0.99
 MAX_MOVES_PER_GAME = 200  
 TRAIN_STEPS_PER_EPISODE = 10 
+TARGET_UPDATE_FREQ = 15  # Sync target_net every N episodes
 
-# --- Setup ---
+# --- Setup Networks ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = ChessBrain().to(device)
-optimizer = optim.Adam(model.parameters(), lr=LR)
+
+# 1. Policy Network (Actively trained)
+policy_net = ChessBrain().to(device)
+
+# 2. Target Network (Frozen mentor for stable target evaluations)
+target_net = ChessBrain().to(device)
+target_net.load_state_dict(policy_net.state_dict())
+target_net.eval()  # Freeze layers like dropout/batchnorm if present
+
+optimizer = optim.Adam(policy_net.parameters(), lr=LR)
 criterion = nn.MSELoss()
 memory = deque(maxlen=MEMORY_SIZE)
 
@@ -61,17 +70,48 @@ def get_board_tensor_array(board):
     return state
 
 def calculate_step_reward(board, move):
-    """Calculates material difference caused by a move."""
+    """Calculates material difference and positional breadcrumbs caused by a move."""
     reward = 0.0
+    
+    # --- 1. Material (Captures) ---
     if board.is_capture(move):
         captured_piece = board.piece_at(move.to_square)
         if captured_piece:
             val = PIECE_VALUES.get(captured_piece.piece_type, 0)
-            reward = val if board.turn == chess.WHITE else -val
+            reward += val if board.turn == chess.WHITE else -val
+
+    # --- UPGRADE B: ADVANCED REWARD SHAPING ---
+    moving_piece = board.piece_at(move.from_square)
+    if moving_piece:
+        # Since White wants positive scores and Black wants negative scores:
+        multiplier = 1.0 if board.turn == chess.WHITE else -1.0
+        
+        # 2. Center Control Breadcrumbs
+        # Squares D4, E4, D5, E5
+        if move.to_square in [chess.D4, chess.E4, chess.D5, chess.E5]:
+            reward += 0.03 * multiplier
+            
+        # 3. Piece Development
+        # Reward moving Knights and Bishops off the starting ranks
+        if moving_piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
+            start_rank = chess.square_rank(move.from_square)
+            if (board.turn == chess.WHITE and start_rank == 0) or (board.turn == chess.BLACK and start_rank == 7):
+                reward += 0.02 * multiplier
+                
+        # 4. King Safety (Early Castling)
+        if board.is_castling(move):
+            reward += 0.15 * multiplier
+            
+        # 5. Premature King Exposure Penalty
+        # Penalize moving the King in the first 10 full moves unless it's castling
+        if moving_piece.piece_type == chess.KING and not board.is_castling(move):
+            if board.fullmove_number < 10:
+                reward -= 0.05 * multiplier
+                
     return reward
 
 def get_best_move_fast(board, current_epsilon):
-    """Selects move using an optimized Batched Epsilon-Greedy policy."""
+    """Selects move using an optimized Batched Epsilon-Greedy policy via policy_net."""
     legal_moves = list(board.legal_moves)
     if not legal_moves: return None
     
@@ -86,14 +126,12 @@ def get_best_move_fast(board, current_epsilon):
         next_states.append(get_board_tensor_array(board))
         board.pop()
         
-    # Stack all next states into a single tensor: shape (Batch, 14, 8, 8)
     batch_tensor = torch.tensor(np.array(next_states), dtype=torch.float32).to(device)
     
     with torch.no_grad():
-        # A SINGLE forward pass for all possible moves
-        vals = model(batch_tensor).view(-1).cpu().numpy()
+        # Evaluate moves using policy_net
+        vals = policy_net(batch_tensor).view(-1).cpu().numpy()
         
-    # Select best move depending on whose turn it is
     if board.turn == chess.WHITE:
         best_idx = np.argmax(vals)
     else:
@@ -112,12 +150,15 @@ def train_batch():
     rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(device)
     dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(1).to(device)
     
-    # Q-learning target
+    # --- Target Network Evaluation ---
+    # Current values evaluated by active policy_net
+    current_values = policy_net(states)
+    
+    # Future values evaluated by frozen target_net for training stability
     with torch.no_grad():
-        next_values = model(next_states)
+        next_values = target_net(next_states)
         targets = rewards + GAMMA * next_values * (1 - dones)
         
-    current_values = model(states)
     loss = criterion(current_values, targets)
     
     optimizer.zero_grad()
@@ -128,7 +169,8 @@ def train_batch():
 
 def main():
     epsilon = EPSILON_START
-    print(f"Starting Highly Optimized Self-Play RL Training on {device}...")
+    print(f"Starting Target Network RL Training on {device}...")
+    print(f"Target Net Sync Frequency: Every {TARGET_UPDATE_FREQ} episodes.")
     start_time = time.time()
     
     for episode in range(1, EPISODES + 1):
@@ -167,16 +209,20 @@ def main():
         epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
         avg_loss = total_loss / TRAIN_STEPS_PER_EPISODE if len(memory) >= BATCH_SIZE else 0
         
+        # --- SYNC TARGET NETWORK ---
+        if episode % TARGET_UPDATE_FREQ == 0:
+            target_net.load_state_dict(policy_net.state_dict())
+            
         outcome = board.result() if not steps >= MAX_MOVES_PER_GAME else "Draw (Move Limit)"
         
-        # Save Checkpoint
+        # Save Checkpoint (policy_net weights)
         if episode % 25 == 0:
-            torch.save(model.state_dict(), "chess_brain.pth")
+            torch.save(policy_net.state_dict(), "chess_brain.pth")
             
         if episode % 10 == 0:
             elapsed_time = time.time() - start_time
             print(f"Ep {episode}/{EPISODES} | Time: {elapsed_time:.1f}s | Moves: {steps} | Result: {outcome} | Avg Loss: {avg_loss:.4f} | Epsilon: {epsilon:.2f}")
-            start_time = time.time() # Reset timer for next batch of 10
+            start_time = time.time()
 
 if __name__ == "__main__":
     main()
