@@ -22,14 +22,30 @@ MAX_MOVES_PER_GAME = 200
 TRAIN_STEPS_PER_EPISODE = 10 
 TARGET_UPDATE_FREQ = 15  # Sync target_net every N episodes
 
+WEIGHTS_FILE = "chess_brain.pth"
+
 # --- Setup Networks ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 1. Policy Network (Actively trained)
 policy_net = ChessBrain().to(device)
 
+# ==========================================
+# STEP 1: LOAD EXISTING KNOWLEDGE
+# ==========================================
+if os.path.exists(WEIGHTS_FILE):
+    try:
+        # Load the weights into the model
+        policy_net.load_state_dict(torch.load(WEIGHTS_FILE, map_location=device, weights_only=True))
+        print(f"SUCCESS: Loaded existing knowledge from '{WEIGHTS_FILE}'. Scazy is building on past training.")
+    except Exception as e:
+        print(f"WARNING: Could not load weights ({e}). Starting fresh.")
+else:
+    print(f"Notice: No existing '{WEIGHTS_FILE}' found. Scazy is starting from scratch.")
+
 # 2. Target Network (Frozen mentor for stable target evaluations)
 target_net = ChessBrain().to(device)
+# Target net copies the policy_net, which now contains our loaded weights
 target_net.load_state_dict(policy_net.state_dict())
 target_net.eval()  # Freeze layers like dropout/batchnorm if present
 
@@ -173,56 +189,71 @@ def main():
     print(f"Target Net Sync Frequency: Every {TARGET_UPDATE_FREQ} episodes.")
     start_time = time.time()
     
-    for episode in range(1, EPISODES + 1):
-        board = chess.Board()
-        steps = 0
-        
-        # --- PLAY THE GAME ---
-        while not board.is_game_over() and steps < MAX_MOVES_PER_GAME:
-            state_matrix = get_board_tensor_array(board)
-            state_tensor = torch.tensor(state_matrix).unsqueeze(0)
+    try:
+        for episode in range(1, EPISODES + 1):
+            board = chess.Board()
+            steps = 0
             
-            move = get_best_move_fast(board, epsilon)
-            
-            step_reward = calculate_step_reward(board, move)
-            board.push(move)
-            
-            next_state_matrix = get_board_tensor_array(board)
-            next_state_tensor = torch.tensor(next_state_matrix).unsqueeze(0)
-            
-            done = board.is_game_over() or steps == MAX_MOVES_PER_GAME - 1
-            
-            if done:
-                res = board.result()
-                if res == '1-0': step_reward += 1.0
-                elif res == '0-1': step_reward -= 1.0
-                else: step_reward += 0.0 # Draw
+            # --- PLAY THE GAME ---
+            while not board.is_game_over() and steps < MAX_MOVES_PER_GAME:
+                state_matrix = get_board_tensor_array(board)
+                state_tensor = torch.tensor(state_matrix).unsqueeze(0)
                 
-            memory.append((state_tensor, next_state_tensor, step_reward, done))
-            steps += 1
+                move = get_best_move_fast(board, epsilon)
+                
+                step_reward = calculate_step_reward(board, move)
+                board.push(move)
+                
+                next_state_matrix = get_board_tensor_array(board)
+                next_state_tensor = torch.tensor(next_state_matrix).unsqueeze(0)
+                
+                done = board.is_game_over() or steps == MAX_MOVES_PER_GAME - 1
+                
+                if done:
+                    res = board.result()
+                    if res == '1-0': step_reward += 1.0
+                    elif res == '0-1': step_reward -= 1.0
+                    else: step_reward += 0.0 # Draw
+                    
+                memory.append((state_tensor, next_state_tensor, step_reward, done))
+                steps += 1
+                
+            # --- TRAIN AT THE END OF THE GAME ---
+            total_loss = 0
+            for _ in range(TRAIN_STEPS_PER_EPISODE):
+                total_loss += train_batch()
+                
+            epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
+            avg_loss = total_loss / TRAIN_STEPS_PER_EPISODE if len(memory) >= BATCH_SIZE else 0
             
-        # --- TRAIN AT THE END OF THE GAME ---
-        total_loss = 0
-        for _ in range(TRAIN_STEPS_PER_EPISODE):
-            total_loss += train_batch()
+            # --- SYNC TARGET NETWORK ---
+            if episode % TARGET_UPDATE_FREQ == 0:
+                target_net.load_state_dict(policy_net.state_dict())
+                
+            outcome = board.result() if not steps >= MAX_MOVES_PER_GAME else "Draw (Move Limit)"
             
-        epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
-        avg_loss = total_loss / TRAIN_STEPS_PER_EPISODE if len(memory) >= BATCH_SIZE else 0
-        
-        # --- SYNC TARGET NETWORK ---
-        if episode % TARGET_UPDATE_FREQ == 0:
-            target_net.load_state_dict(policy_net.state_dict())
-            
-        outcome = board.result() if not steps >= MAX_MOVES_PER_GAME else "Draw (Move Limit)"
-        
-        # Save Checkpoint (policy_net weights)
-        if episode % 25 == 0:
-            torch.save(policy_net.state_dict(), "chess_brain.pth")
-            
-        if episode % 10 == 0:
-            elapsed_time = time.time() - start_time
-            print(f"Ep {episode}/{EPISODES} | Time: {elapsed_time:.1f}s | Moves: {steps} | Result: {outcome} | Avg Loss: {avg_loss:.4f} | Epsilon: {epsilon:.2f}")
-            start_time = time.time()
+            # Periodic Checkpoint (policy_net weights)
+            if episode % 25 == 0:
+                torch.save(policy_net.state_dict(), WEIGHTS_FILE)
+                
+            if episode % 10 == 0:
+                elapsed_time = time.time() - start_time
+                print(f"Ep {episode}/{EPISODES} | Time: {elapsed_time:.1f}s | Moves: {steps} | Result: {outcome} | Avg Loss: {avg_loss:.4f} | Epsilon: {epsilon:.2f}")
+                start_time = time.time()
+
+        # ==========================================
+        # STEP 2: SAVE THE FINAL KNOWLEDGE (If loop finishes completely)
+        # ==========================================
+        torch.save(policy_net.state_dict(), WEIGHTS_FILE)
+        print(f"\nTRAINING COMPLETE! Upgraded brain saved securely to {WEIGHTS_FILE}.")
+
+    except KeyboardInterrupt:
+        # ==========================================
+        # STEP 3: EMERGENCY SAVE (Triggers if you press Ctrl+C)
+        # ==========================================
+        print("\n\nTraining stopped by user (Ctrl+C)! Saving current progress...")
+        torch.save(policy_net.state_dict(), WEIGHTS_FILE)
+        print(f"Emergency save complete. All progress up to this point is saved in {WEIGHTS_FILE}.")
 
 if __name__ == "__main__":
     main()
