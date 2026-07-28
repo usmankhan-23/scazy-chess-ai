@@ -7,6 +7,7 @@ import json
 import os
 import time
 import random
+import threading
 from model import ChessBrain
 
 # --- Window & Styling Configuration ---
@@ -72,6 +73,9 @@ try:
 except FileNotFoundError:
     print("Warning: 'chess_brain.pth' not found. Scazy running with base weights.")
 
+# Transposition / Evaluation Cache for AI Speedup
+eval_cache = {}
+
 def get_board_tensor_array(board):
     """Converts the board into a 14x8x8 multi-channel matrix for the AI's vision."""
     state = np.zeros((14, 8, 8), dtype=np.float32)
@@ -98,20 +102,44 @@ def get_board_tensor_array(board):
 
     return state
 
-def minimax_rl(board, depth, alpha, beta, maximizing_player):
-    """Alpha-beta search utilizing the RL Value Network."""
+def evaluate_board(board):
+    """Evaluates position using RL neural net with caching."""
+    fen = board.fen()
+    if fen in eval_cache:
+        return eval_cache[fen]
+    
+    state_tensor = torch.tensor(get_board_tensor_array(board), dtype=torch.float32).unsqueeze(0).to(device)
+    with torch.no_grad():
+        val = brain(state_tensor).item()
+    
+    eval_cache[fen] = val
+    return val
+
+def minimax_rl(board, depth, alpha, beta, maximizing_player, start_time, time_limit):
+    """Time-bounded Alpha-beta search with move ordering and caching."""
+    # Check if time budget exceeded
+    if time.time() - start_time > time_limit:
+        return None, None  # Signals time budget limit exceeded
+
     if depth == 0 or board.is_game_over():
-        state_tensor = torch.tensor(get_board_tensor_array(board), dtype=torch.float32).unsqueeze(0).to(device)
-        with torch.no_grad():
-            return brain(state_tensor).item(), None
+        return evaluate_board(board), None
 
     best_move = None
+    moves = list(board.legal_moves)
+    
+    # Move ordering: Order captures and checks first to trigger aggressive pruning
+    moves.sort(key=lambda m: (board.is_capture(m), board.gives_check(m)), reverse=True)
+
     if maximizing_player:
         max_eval = -float('inf')
-        for move in board.legal_moves:
+        for move in moves:
             board.push(move)
-            eval_val, _ = minimax_rl(board, depth - 1, alpha, beta, False)
+            eval_val, _ = minimax_rl(board, depth - 1, alpha, beta, False, start_time, time_limit)
             board.pop()
+            
+            if eval_val is None: # Timed out during recursion
+                return None, None
+
             if eval_val > max_eval:
                 max_eval = eval_val; best_move = move
             alpha = max(alpha, eval_val)
@@ -119,53 +147,70 @@ def minimax_rl(board, depth, alpha, beta, maximizing_player):
         return max_eval, best_move
     else:
         min_eval = float('inf')
-        for move in board.legal_moves:
+        for move in moves:
             board.push(move)
-            eval_val, _ = minimax_rl(board, depth - 1, alpha, beta, True)
+            eval_val, _ = minimax_rl(board, depth - 1, alpha, beta, True, start_time, time_limit)
             board.pop()
+
+            if eval_val is None: # Timed out during recursion
+                return None, None
+
             if eval_val < min_eval:
                 min_eval = eval_val; best_move = move
             beta = min(beta, eval_val)
             if beta <= alpha: break
         return min_eval, best_move
 
-def get_scazy_move(board, difficulty):
+def get_scazy_move(board, difficulty, remaining_time=None):
     legal_moves = list(board.legal_moves)
     if not legal_moves: return None
     
     is_white = board.turn == chess.WHITE
+    start_time = time.time()
+    eval_cache.clear()
 
-    # --- EASY MODE ---
-    # High randomness, 1-ply search, occasionally picks random top 3 moves
-    if difficulty == "Easy":
-        if random.random() < 0.3:  # 30% chance to just pick a random move
-            return random.choice(legal_moves)
-            
-        move_scores = []
-        for move in legal_moves:
-            board.push(move)
-            score, _ = minimax_rl(board, 1, -float('inf'), float('inf'), not is_white)
-            board.pop()
-            move_scores.append((score, move))
-            
-        # Sort and pick randomly from the top 3 moves
-        move_scores.sort(key=lambda x: x[0], reverse=is_white)
-        top_moves = [m[1] for m in move_scores[:3]]
-        return random.choice(top_moves)
+    # Dynamic Time Allocation per Move
+    if remaining_time is not None and remaining_time > 0:
+        if remaining_time < 10:          # Emergency Blitz (< 10 seconds left)
+            time_limit = 0.2
+            max_target_depth = 1
+        elif remaining_time < 30:        # Time Pressure (< 30 seconds left)
+            time_limit = 0.8
+            max_target_depth = 2
+        else:                            # Normal Play
+            time_limit = min(2.5, max(0.5, remaining_time / 25.0))
+            max_target_depth = 1 if difficulty == "Easy" else (2 if difficulty == "Medium" else 3)
+    else:
+        time_limit = 2.0
+        max_target_depth = 1 if difficulty == "Easy" else (2 if difficulty == "Medium" else 3)
 
-    # --- MEDIUM MODE ---
-    # Balanced 2-ply search, very low randomness
-    elif difficulty == "Medium":
-        if random.random() < 0.05: # 5% mistake rate
-            return random.choice(legal_moves)
-        _, move = minimax_rl(board, 2, -float('inf'), float('inf'), is_white)
-        return move if move else random.choice(legal_moves)
+    # Easy Mode fast path
+    if difficulty == "Easy" and random.random() < 0.3:
+        return random.choice(legal_moves)
 
-    # --- HARD MODE ---
-    # Strict deterministic evaluation, 4-ply deep search
-    elif difficulty == "Hard":
-        _, move = minimax_rl(board, 4, -float('inf'), float('inf'), is_white)
-        return move if move else random.choice(legal_moves)
+    best_move_so_far = random.choice(legal_moves)
+
+    # Iterative Deepening Search
+    for current_depth in range(1, max_target_depth + 1):
+        score, move = minimax_rl(board, current_depth, -float('inf'), float('inf'), is_white, start_time, time_limit)
+        if move is not None:
+            best_move_so_far = move
+        
+        # Stop searching deeper if 80% of allotted time budget is used
+        if time.time() - start_time >= time_limit * 0.8:
+            break
+
+    return best_move_so_far
+
+# --- Background AI Thread Control ---
+ai_thinking = False
+ai_calculated_move = None
+
+def make_ai_move_async(board_copy, difficulty, remaining_time):
+    """Executes AI search on a background thread without freezing UI or wasting clock time."""
+    global ai_thinking, ai_calculated_move
+    ai_calculated_move = get_scazy_move(board_copy, difficulty, remaining_time)
+    ai_thinking = False
 
 # --- UI Helper Components ---
 def draw_button(text, rect, is_hovered, color=BUTTON_COLOR):
@@ -209,7 +254,10 @@ def draw_top_banner(board, game_mode, timer_enabled, white_time, black_time, p1_
     draw_button("Menu", menu_btn_rect, menu_btn_rect.collidepoint(pygame.mouse.get_pos()))
 
     if not board.is_game_over():
-        turn_str = f"{p1_name}'s Turn" if board.turn == chess.WHITE else (f"{p2_name} Thinking..." if game_mode == "HVC" else f"{p2_name}'s Turn")
+        if ai_thinking:
+            turn_str = f"{p2_name} Thinking..."
+        else:
+            turn_str = f"{p1_name}'s Turn" if board.turn == chess.WHITE else f"{p2_name}'s Turn"
         screen.blit(small_font.render(f"Status: {turn_str}", True, GOLD_COLOR), (15, 82))
     return menu_btn_rect
 
@@ -242,6 +290,8 @@ def draw_pieces(board):
 
 # --- Main Application Logic ---
 def main():
+    global ai_thinking, ai_calculated_move
+    
     state = "MENU"
     game_mode = "HVC"
     difficulty = "Medium"
@@ -340,6 +390,7 @@ def main():
                         p1_name = p1_input_temp.strip() or "Player 1"
                         p2_name = p2_input_temp.strip() or ("Scazy" if game_mode == "HVC" else "Player 2")
                         board.reset(); selected_square = None; winner_recorded = False; winner_display_name = None; move_history = []
+                        ai_thinking = False; ai_calculated_move = None
                         white_time = black_time = timer_preset; last_tick_time = time.time(); state = "GAME"
                 elif event.type == pygame.KEYDOWN:
                     if active_input == 1:
@@ -360,6 +411,21 @@ def main():
             last_tick_time = curr_time
             
             timeout_winner = p2_name if (timer_preset and white_time <= 0) else (p1_name if (timer_preset and black_time <= 0) else None)
+
+            # Trigger AI Calculation in Background Thread with Clock Awareness
+            if game_mode == "HVC" and board.turn == chess.BLACK and not board.is_game_over() and not timeout_winner:
+                if not ai_thinking and ai_calculated_move is None:
+                    ai_thinking = True
+                    rem_time = black_time if (timer_preset is not None) else None
+                    ai_thread = threading.Thread(target=make_ai_move_async, args=(board.copy(), difficulty, rem_time), daemon=True)
+                    ai_thread.start()
+
+            # Apply Completed AI Move to Board
+            if ai_calculated_move is not None:
+                board.push(ai_calculated_move)
+                move_history.append(ai_calculated_move)
+                ai_calculated_move = None
+                last_tick_time = time.time()
 
             draw_board(selected_square, show_coords)
             draw_legal_moves(board, selected_square)
@@ -392,12 +458,7 @@ def main():
                 status_txt = "TIME EXPIRED!" if timeout_winner else "GAME OVER!"
                 screen.blit(font.render(status_txt, True, RED_COLOR), font.render(status_txt, True, RED_COLOR).get_rect(center=(WIDTH//2, BANNER_HEIGHT + 200)))
                 
-                # Render the explicit winner text
-                if winner_display_name == "Draw":
-                    win_text = "Match ended in a Draw!"
-                else:
-                    win_text = f"Winner: {winner_display_name}!"
-                
+                win_text = "Match ended in a Draw!" if winner_display_name == "Draw" else f"Winner: {winner_display_name}!"
                 screen.blit(title_font.render(win_text, True, GOLD_COLOR), title_font.render(win_text, True, GOLD_COLOR).get_rect(center=(WIDTH//2, BANNER_HEIGHT + 235)))
 
                 btn_rematch = pygame.Rect(100, BANNER_HEIGHT + 265, 140, 30)
@@ -405,22 +466,20 @@ def main():
                 draw_button("Rematch", btn_rematch, btn_rematch.collidepoint(mouse_pos), (40, 160, 80))
                 draw_button("Analyze Game", btn_analyze, btn_analyze.collidepoint(mouse_pos), (140, 80, 180))
 
-            if game_mode == "HVC" and board.turn == chess.BLACK and not board.is_game_over() and not timeout_winner:
-                pygame.display.flip(); pygame.time.wait(150)
-                ai_move = get_scazy_move(board, difficulty)
-                if ai_move: board.push(ai_move); move_history.append(ai_move)
-
             for event in pygame.event.get():
                 if event.type == pygame.QUIT: running = False
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if menu_btn.collidepoint(mouse_pos): state = "MENU"
+                    if menu_btn.collidepoint(mouse_pos): 
+                        ai_thinking = False; ai_calculated_move = None; state = "MENU"
                     elif board.is_game_over() or timeout_winner:
                         if btn_rematch.collidepoint(mouse_pos):
                             board.reset(); selected_square = None; winner_recorded = False; winner_display_name = None; move_history = []
+                            ai_thinking = False; ai_calculated_move = None
                             white_time = black_time = timer_preset; last_tick_time = time.time()
                         elif btn_analyze.collidepoint(mouse_pos):
                             analysis_index = len(move_history); state = "ANALYZE"
                     elif not board.is_game_over() and not timeout_winner and mouse_pos[1] >= BANNER_HEIGHT:
+                        # Human turn handling
                         if (board.turn == chess.WHITE) if game_mode == "HVC" else True:
                             clicked_sq = chess.square(mouse_pos[0] // SQ_SIZE, 7 - ((mouse_pos[1] - BANNER_HEIGHT) // SQ_SIZE))
                             if selected_square is None:
@@ -430,7 +489,9 @@ def main():
                                 move = chess.Move(selected_square, clicked_sq)
                                 if board.piece_at(selected_square) and board.piece_at(selected_square).piece_type == chess.PAWN and chess.square_rank(clicked_sq) in (0, 7):
                                     move = chess.Move(selected_square, clicked_sq, promotion=chess.QUEEN)
-                                if move in board.legal_moves: board.push(move); move_history.append(move)
+                                if move in board.legal_moves: 
+                                    board.push(move)
+                                    move_history.append(move)
                                 selected_square = None
 
         # 4. GAME ANALYSIS SCREEN
@@ -500,8 +561,9 @@ def main():
                 "   - Enter custom player names before the match starts.",
                 "   - AI is permanently locked as 'Scazy'.",
                 "",
-                "2. Professional Time Controls:",
-                "   - Toggleable timer: Off, 3m Blitz, 5m Blitz, 10m Rapid.",
+                "2. Dynamic Clock & Speed Control:",
+                "   - Scazy calculates dynamic time budget per move.",
+                "   - Automatic fast fallback under 10 seconds remaining.",
                 "",
                 "3. Visuals & Move Highlights:",
                 "   - Dots mark valid empty destination squares.",
