@@ -10,7 +10,7 @@ import time
 from model import ChessBrain
 
 # --- Hyperparameters ---
-EPISODES = 620
+EPISODES = 1000
 BATCH_SIZE = 128 
 GAMMA = 0.95
 LR = 0.001
