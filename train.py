@@ -10,7 +10,7 @@ import time
 from model import ChessBrain
 
 # --- Hyperparameters ---
-EPISODES = 9000
+EPISODES = 350
 BATCH_SIZE = 128 
 GAMMA = 0.95
 LR = 0.001
@@ -18,7 +18,7 @@ MEMORY_SIZE = 100000
 EPSILON_START = 1.0
 EPSILON_END = 0.1
 EPSILON_DECAY = 0.99
-MAX_MOVES_PER_GAME = 200 
+MAX_MOVES_PER_GAME = 10000 
 TRAIN_STEPS_PER_EPISODE = 10 
 TARGET_UPDATE_FREQ = 15  # Sync target_net every N episodes
 
